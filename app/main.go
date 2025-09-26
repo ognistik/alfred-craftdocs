@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"os"
 
 	aw "github.com/deanishe/awgo"
-	"github.com/mattn/go-sqlite3"
 )
 
 func main() {
@@ -17,8 +15,7 @@ func main() {
 
 //nolint:gochecknoinits
 func init() {
-	sql.Register("sqlite3_custom", &sqlite3.SQLiteDriver{})
-
+	// Use standard sqlite3 driver with FTS5 support
 	if len(os.Getenv("alfred_workflow_bundleid")) == 0 {
 		if err := os.Setenv("alfred_workflow_bundleid", "dev.kudrykv.craftsearchindex"); err != nil {
 			panic(err)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -14,7 +15,11 @@ import (
 	"github.com/kudrykv/alfred-craftdocs-searchindex/app/repository"
 	"github.com/kudrykv/alfred-craftdocs-searchindex/app/service"
 	"github.com/kudrykv/alfred-craftdocs-searchindex/app/types"
+	_ "github.com/mattn/go-sqlite3" // Import for side effects (registers sqlite3 driver)
 )
+
+// Regex to match date-like titles in format XXXX.XX.XX (e.g., 2025.01.28)
+var dateTitleRegex = regexp.MustCompile(`^\d{4}\.\d{2}\.\d{2}$`)
 
 func initialize() (*config.Config, *service.BlockService, error) {
 	cfg, err := config.NewConfig()
@@ -24,7 +29,7 @@ func initialize() (*config.Config, *service.BlockService, error) {
 
 	var spaces []repository.Space
 	for _, si := range cfg.SearchIndexes() {
-		db, err := sql.Open("sqlite3_custom", si.Path())
+		db, err := sql.Open("sqlite3", si.Path())
 		if err != nil {
 			return nil, nil, fmt.Errorf("sql open: %w", err)
 		}
@@ -95,6 +100,11 @@ func workflow(ctx context.Context, wf *aw.Workflow, args []string) func() {
 
 		newDocumentEntryAdded := false
 		for _, block := range blocks {
+			// Skip documents with date-like titles (XXXX.XX.XX format)
+			if block.IsDocument() && dateTitleRegex.MatchString(block.Content) {
+				continue
+			}
+
 			// Append new document after documents but before
 			// individual blocks.
 			if !newDocumentEntryAdded && !block.IsDocument() {
