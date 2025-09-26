@@ -13,6 +13,8 @@ import (
 
 const (
 	searchResultLimit = 40
+	// Fetch extra results to account for date filtering
+	fetchBuffer = 20
 )
 
 type Space struct {
@@ -51,6 +53,46 @@ func (b *Block) IsDocument() bool {
 	return b.EntityType == "document"
 }
 
+// isDateTitle checks if the content matches the date pattern YYYY.MM.DD
+func isDateTitle(content string) bool {
+	if len(content) != 10 {
+		return false
+	}
+	// Check pattern: YYYY.MM.DD
+	return content[4] == '.' && content[7] == '.' &&
+		isDigits(content[0:4]) && isDigits(content[5:7]) && isDigits(content[8:10])
+}
+
+// isDigits checks if all characters in the string are digits
+func isDigits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// filterDateTitles removes documents with date-like titles and returns exactly searchResultLimit items
+func (b *BlockRepo) filterDateTitles(blocks []Block) []Block {
+	filtered := make([]Block, 0, len(blocks))
+
+	for _, block := range blocks {
+		// Skip documents with date-like titles
+		if block.IsDocument() && isDateTitle(block.Content) {
+			continue
+		}
+		filtered = append(filtered, block)
+
+		// Stop once we have enough results
+		if len(filtered) >= searchResultLimit {
+			break
+		}
+	}
+
+	return filtered
+}
+
 // buildMatchQuery creates a FTS5 match query that searches both content
 // and exactMatchContent (only set for documents). Content is used for
 // regular full-text search and including exactMatchContent allows for
@@ -60,9 +102,8 @@ func (b *Block) IsDocument() bool {
 //
 // Example output:
 //
-// 	{content exactMatchContent} : ("my" "todo") OR ("my" "todo"*) OR ("my"* "todo"*)
-// 	{content exactMatchContent} : ("mytodo") OR ("mytodo"*)
-//
+//	{content exactMatchContent} : ("my" "todo") OR ("my" "todo"*) OR ("my"* "todo"*)
+//	{content exactMatchContent} : ("mytodo") OR ("mytodo"*)
 func buildMatchQuery(terms []string) string {
 	if len(terms) == 0 {
 		return ""
@@ -106,14 +147,55 @@ func buildMatchQuery(terms []string) string {
 	return matchQuery
 }
 
+func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []string, limit int) (*sql.Rows, error) {
+	// Build LIKE query for fallback when FTS5 is not available
+	// Try multiple table names in case the structure varies
+	tableNames := []string{"BlockSearch_content", "BlockSearch"}
+
+	for _, tableName := range tableNames {
+		conditions := make([]string, 0, len(terms))
+		args := make([]interface{}, 0, len(terms)+1)
+
+		for _, term := range terms {
+			conditions = append(conditions, "c1 LIKE ?") // c1 contains the content
+			args = append(args, "%"+term+"%")
+		}
+
+		whereClause := strings.Join(conditions, " AND ")
+		query := fmt.Sprintf(`
+			SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId 
+			FROM %s 
+			WHERE %s 
+			LIMIT ?
+		`, tableName, whereClause)
+
+		args = append(args, limit)
+		log.Printf("Trying LIKE query on %s: %s, args: %v", tableName, query, args)
+
+		rows, err := space.DB.QueryContext(ctx, query, args...)
+		if err == nil {
+			return rows, nil
+		}
+		log.Printf("LIKE query on %s failed: %v", tableName, err)
+	}
+
+	// If both table attempts fail, try a simpler approach
+	log.Printf("All LIKE queries failed, trying basic search")
+	return space.DB.QueryContext(ctx, "SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content LIMIT ?", limit)
+}
+
 func (b *BlockRepo) Search(ctx context.Context, terms []string) ([]Block, error) {
 	matchQuery := buildMatchQuery(terms)
 	log.Printf("Searching with matchQuery: '%s'", matchQuery)
 
-	blocks := make([]Block, 0, 40)
+	blocks := make([]Block, 0, searchResultLimit)
 	for _, space := range b.spaces {
-		limit := searchResultLimit - len(blocks)
-		if limit == 0 {
+		// Fetch extra results to account for date filtering
+		limit := searchResultLimit + fetchBuffer - len(blocks)
+		if limit <= fetchBuffer {
+			limit = searchResultLimit + fetchBuffer
+		}
+		if limit == fetchBuffer && len(blocks) >= searchResultLimit {
 			break
 		}
 		log.Printf("Searching %s, limit %d", space.ID, limit)
@@ -121,6 +203,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string) ([]Block, error)
 		var rows *sql.Rows
 		var err error
 		if len(matchQuery) > 0 {
+			// Try FTS5 first, with error handling
 			query := `
 				SELECT id, content, entityType, documentId
 				FROM BlockSearch(?)
@@ -128,6 +211,20 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string) ([]Block, error)
 				LIMIT ?
 			`
 			rows, err = space.DB.QueryContext(ctx, query, matchQuery, limit)
+			if err != nil {
+				log.Printf("FTS5 query failed: %v", err)
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "no such module: fts5") || strings.Contains(errMsg, "no such table") {
+					log.Printf("FTS5 not available, falling back to LIKE search")
+					rows, err = b.searchWithLike(ctx, space, terms, limit)
+					if err != nil {
+						log.Printf("LIKE search also failed: %v", err)
+						return nil, types.NewError("failed to query database search", err)
+					}
+				} else {
+					return nil, types.NewError("failed to query database search", err)
+				}
+			}
 		} else {
 			// No search terms were provided, fallback to listing
 			// all results according to whatever custom rank Craft
@@ -162,7 +259,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string) ([]Block, error)
 		}
 	}
 
-	return blocks, nil
+	return b.filterDateTitles(blocks), nil
 }
 
 type docKey struct {
