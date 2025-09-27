@@ -84,19 +84,25 @@ func main() {
 
 	// Read from Alfred's JSON input or environment variable
 	allSpacesStr := os.Getenv("allSpaces")
-	if allSpacesStr == "" {
+	primarySpaceStr := os.Getenv("primarySpace")
+	if allSpacesStr == "" || primarySpaceStr == "" {
 		// Try to read from Alfred's stdin JSON (workflow variables)
 		if jsonBytes, err := io.ReadAll(os.Stdin); err == nil {
 			var alfredInput struct {
 				Variables map[string]string `json:"variables"`
 			}
 			if json.Unmarshal(jsonBytes, &alfredInput) == nil {
-				allSpacesStr = alfredInput.Variables["allSpaces"]
+				if allSpacesStr == "" {
+					allSpacesStr = alfredInput.Variables["allSpaces"]
+				}
+				if primarySpaceStr == "" {
+					primarySpaceStr = alfredInput.Variables["primarySpace"]
+				}
 			}
 		}
 	}
 	allSpaces := allSpacesStr == "1"
-	log.Printf("Search scope: allSpaces=%t (raw: '%s')", allSpaces, allSpacesStr)
+	log.Printf("Search scope: allSpaces=%t (raw: '%s'), primarySpace='%s'", allSpaces, allSpacesStr, primarySpaceStr)
 
 	cfg, blockService, _, err := initialize()
 	if err != nil {
@@ -107,9 +113,14 @@ func main() {
 	defer func() { _ = blockService.Close() }()
 
 	var currentSpaceID string
-	if !allSpaces && len(cfg.SearchIndexes()) > 0 {
-		currentSpaceID = cfg.SearchIndexes()[0].SpaceID // Primary space
-		log.Printf("Using primary space: %s", currentSpaceID)
+	if !allSpaces {
+		if primarySpaceStr != "" {
+			currentSpaceID = primarySpaceStr
+			log.Printf("Using configured primary space: %s", currentSpaceID)
+		} else if len(cfg.SearchIndexes()) > 0 {
+			currentSpaceID = cfg.SearchIndexes()[0].SpaceID // Fallback to first space
+			log.Printf("Using fallback primary space (first space): %s", currentSpaceID)
+		}
 	} else {
 		log.Printf("Searching all spaces")
 	}
@@ -150,11 +161,25 @@ func main() {
 			addCreateNewDocument(wf, config, os.Args[1:])
 			newDocumentEntryAdded = true
 		}
+
+		// Use appropriate spaceId for URL generation
+		var urlSpaceID string
+		if allSpaces {
+			// When searching all spaces, use the actual space where the block exists
+			urlSpaceID = block.SpaceID
+		} else {
+			// When searching primary space only, use the primary space ID for all URLs
+			urlSpaceID = currentSpaceID
+			if urlSpaceID == "" && len(cfg.SearchIndexes()) > 0 {
+				urlSpaceID = cfg.SearchIndexes()[0].SpaceID // Fallback
+			}
+		}
+
 		wf.
 			NewItem(block.Content).
 			Subtitle(block.DocumentName).
 			UID(block.ID).
-			Arg("craftdocs://open?blockId=" + block.ID + "&spaceId=" + block.SpaceID).
+			Arg("craftdocs://open?blockId=" + block.ID + "&spaceId=" + urlSpaceID).
 			Valid(true)
 	}
 }

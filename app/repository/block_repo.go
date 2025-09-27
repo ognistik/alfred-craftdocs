@@ -198,12 +198,33 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 	return space.DB.QueryContext(ctx, "SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content LIMIT ?", limit)
 }
 
-func (b *BlockRepo) Search(ctx context.Context, terms []string) ([]Block, error) {
+func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, currentSpaceID string) ([]Block, error) {
 	matchQuery := buildMatchQuery(terms)
 	log.Printf("Searching with matchQuery: '%s'", matchQuery)
 
 	blocks := make([]Block, 0, searchResultLimit)
-	for _, space := range b.spaces {
+
+	// Filter spaces based on allSpaces and currentSpaceID
+	var spacesToSearch []Space
+	if allSpaces {
+		spacesToSearch = b.spaces
+	} else if currentSpaceID != "" {
+		// Only search the specified primary space
+		for _, space := range b.spaces {
+			if space.ID == currentSpaceID {
+				spacesToSearch = []Space{space}
+				break
+			}
+		}
+		if len(spacesToSearch) == 0 {
+			log.Printf("Primary space %s not found, searching all spaces", currentSpaceID)
+			spacesToSearch = b.spaces
+		}
+	} else {
+		spacesToSearch = b.spaces
+	}
+
+	for _, space := range spacesToSearch {
 		// Fetch extra results to account for date filtering
 		limit := searchResultLimit + fetchBuffer - len(blocks)
 		if limit <= fetchBuffer {

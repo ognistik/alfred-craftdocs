@@ -11,7 +11,7 @@ import (
 	"github.com/caarlos0/env/v6"
 )
 
-var regexIndexName = regexp.MustCompile(`^SearchIndex_([a-zA-Z0-9-]+)(?:\|\|.*)?\.sqlite$`)
+var regexIndexName = regexp.MustCompile(`^SearchIndex_([a-zA-Z0-9-]+(?:\|\|[a-zA-Z0-9-]+)*)\.sqlite$`)
 
 // Primary space search index does not contain `||`, however, the search index
 // for secondary spaces are named `primary||secondary`.

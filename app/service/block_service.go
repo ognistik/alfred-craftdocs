@@ -20,8 +20,7 @@ func NewBlockService(br *repository.BlockRepo) *BlockService {
 }
 
 func (r *BlockService) Search(ctx context.Context, args []string, allSpaces bool, currentSpaceID string) ([]repository.Block, error) {
-	// The repository Search doesn't support allSpaces/currentSpaceID yet
-	blocks, err := r.br.Search(ctx, args)
+	blocks, err := r.br.Search(ctx, args, allSpaces, currentSpaceID)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
