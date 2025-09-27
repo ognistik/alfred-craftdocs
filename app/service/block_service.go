@@ -19,13 +19,19 @@ func NewBlockService(br *repository.BlockRepo) *BlockService {
 	return &BlockService{br: br}
 }
 
-func (r *BlockService) Search(ctx context.Context, args []string) ([]repository.Block, error) {
+func (r *BlockService) Search(ctx context.Context, args []string, allSpaces bool, currentSpaceID string) ([]repository.Block, error) {
+	// The repository Search doesn't support allSpaces/currentSpaceID yet
 	blocks, err := r.br.Search(ctx, args)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
 
-	blocks, err = r.br.BackfillDocumentNames(ctx, blocks)
+	targetSpaceIDs := make(map[string]struct{})
+	for _, block := range blocks {
+		targetSpaceIDs[block.SpaceID] = struct{}{}
+	}
+
+	blocks, err = r.br.BackfillDocumentNames(ctx, blocks, targetSpaceIDs)
 	if err != nil {
 		return nil, fmt.Errorf("backfill document names: %w", err)
 	}

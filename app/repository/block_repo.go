@@ -153,23 +153,37 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 	tableNames := []string{"BlockSearch_content", "BlockSearch"}
 
 	for _, tableName := range tableNames {
-		conditions := make([]string, 0, len(terms))
-		args := make([]interface{}, 0, len(terms)+1)
+		var query string
+		var args []interface{}
 
-		for _, term := range terms {
-			conditions = append(conditions, "c1 LIKE ?") // c1 contains the content
-			args = append(args, "%"+term+"%")
+		if len(terms) == 0 {
+			// No search terms, return all results ordered by some criteria
+			query = fmt.Sprintf(`
+				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId 
+				FROM %s 
+				ORDER BY c0 
+				LIMIT ?
+			`, tableName)
+			args = []interface{}{limit}
+		} else {
+			conditions := make([]string, 0, len(terms))
+			args = make([]interface{}, 0, len(terms)+1)
+
+			for _, term := range terms {
+				conditions = append(conditions, "c1 LIKE ?") // c1 contains the content
+				args = append(args, "%"+term+"%")
+			}
+
+			whereClause := strings.Join(conditions, " AND ")
+			query = fmt.Sprintf(`
+				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId 
+				FROM %s 
+				WHERE %s 
+				LIMIT ?
+			`, tableName, whereClause)
+			args = append(args, limit)
 		}
 
-		whereClause := strings.Join(conditions, " AND ")
-		query := fmt.Sprintf(`
-			SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId 
-			FROM %s 
-			WHERE %s 
-			LIMIT ?
-		`, tableName, whereClause)
-
-		args = append(args, limit)
 		log.Printf("Trying LIKE query on %s: %s, args: %v", tableName, query, args)
 
 		rows, err := space.DB.QueryContext(ctx, query, args...)
@@ -235,6 +249,19 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string) ([]Block, error)
 			// edited or created.
 			query := "SELECT id, content, entityType, documentId FROM BlockSearch ORDER BY customRank LIMIT ?"
 			rows, err = space.DB.QueryContext(ctx, query, limit)
+			if err != nil {
+				// FTS5 not available, use fallback
+				if strings.Contains(err.Error(), "no such module: fts5") || strings.Contains(err.Error(), "no such table") {
+					log.Printf("FTS5 not available for empty search, falling back to LIKE search")
+					rows, err = b.searchWithLike(ctx, space, terms, limit)
+					if err != nil {
+						log.Printf("LIKE search also failed: %v", err)
+						return nil, types.NewError("failed to query database search", err)
+					}
+				} else {
+					return nil, types.NewError("failed to query database", err)
+				}
+			}
 		}
 		if err != nil {
 			return nil, types.NewError("failed to query database", err)
@@ -267,7 +294,7 @@ type docKey struct {
 	docID   string
 }
 
-func (b *BlockRepo) BackfillDocumentNames(ctx context.Context, blocks []Block) ([]Block, error) {
+func (b *BlockRepo) BackfillDocumentNames(ctx context.Context, blocks []Block, targetSpaceIDs map[string]struct{}) ([]Block, error) {
 	if len(blocks) == 0 {
 		return blocks, nil
 	}
@@ -296,7 +323,16 @@ func (b *BlockRepo) BackfillDocumentNames(ctx context.Context, blocks []Block) (
 		query := `select documentId, content from BlockSearch where entityType = 'document' and documentId in (` + strings.Join(placeholders, ", ") + ")"
 		rows, err := space.DB.QueryContext(ctx, query, ids...)
 		if err != nil {
-			return nil, types.NewError("failed to query the database", err)
+			// Try fallback table if BlockSearch fails (FTS5 not available)
+			if strings.Contains(err.Error(), "no such module: fts5") || strings.Contains(err.Error(), "no such table") {
+				query = `select c7 as documentId, c1 as content from BlockSearch_content where c3 = 'document' and c7 in (` + strings.Join(placeholders, ", ") + ")"
+				rows, err = space.DB.QueryContext(ctx, query, ids...)
+				if err != nil {
+					return nil, types.NewError("failed to query the database", err)
+				}
+			} else {
+				return nil, types.NewError("failed to query the database", err)
+			}
 		}
 
 		for rows.Next() {

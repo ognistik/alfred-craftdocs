@@ -11,9 +11,10 @@ import (
 	"github.com/caarlos0/env/v6"
 )
 
+var regexIndexName = regexp.MustCompile(`^SearchIndex_([a-zA-Z0-9-]+)(?:\|\|.*)?\.sqlite$`)
+
 // Primary space search index does not contain `||`, however, the search index
 // for secondary spaces are named `primary||secondary`.
-var regexIndexName = regexp.MustCompile(`^SearchIndex_([a-zA-Z0-9-\|]+)\.sqlite$`)
 
 type SearchIndex struct {
 	SpaceID string
@@ -26,13 +27,17 @@ func (si SearchIndex) Path() string {
 }
 
 type Config struct {
-	//nolint:lll
 	IndexPathDir string `env:"INDEX_PATH_DIR" envDefault:"~/Library/Containers/com.lukilabs.lukiapp/Data/Library/Application Support/com.lukilabs.lukiapp/Search"`
 	indexes      []SearchIndex
 }
 
 func (c *Config) SearchIndexes() []SearchIndex {
 	return c.indexes
+}
+
+func (c *Config) MainDBPath() string {
+	homeDir := os.Getenv("HOME")
+	return filepath.Join(homeDir, "Library/Containers/com.lukilabs.lukiapp/Data/Library/Application Support/com.lukilabs.lukiapp/LukiMain_dbf93b0b-3c55-5ab0-745b-9fa6a60fc3d2_999609FB-390A-496E-9AA3-2F9B55D6C43C.realm")
 }
 
 func NewConfig() (*Config, error) {
@@ -61,9 +66,14 @@ func NewConfig() (*Config, error) {
 		}
 
 		if regexIndexName.MatchString(entry.Name()) {
-			spaceID := strings.Split(regexIndexName.FindStringSubmatch(entry.Name())[1], "||")
+			match := regexIndexName.FindStringSubmatch(entry.Name())
+			if len(match) < 2 {
+				continue
+			}
+			spacePart := match[1]
+			spaceIDs := strings.Split(spacePart, "||")
 			config.indexes = append(config.indexes, SearchIndex{
-				SpaceID: spaceID[len(spaceID)-1], // Select the last entry in the slice (primary/secondary).
+				SpaceID: spaceIDs[len(spaceIDs)-1],
 				name:    entry.Name(),
 				dir:     config.IndexPathDir,
 			})
