@@ -94,70 +94,12 @@ func (b *BlockRepo) filterDateTitles(blocks []Block, daily bool) []Block {
 	return filtered
 }
 
-// buildMatchQuery creates a FTS5 match query that searches both content
-// and exactMatchContent (only set for documents). Content is used for
-// regular full-text search and including exactMatchContent allows for
-// searches like "mylist" that will match a document named "My List".
-//
-// The query uses AND to match all terms independently, allowing non-adjacent
-// matches. For example, searching "craft workflow" will match "Craft Alfred Workflow"
-// because both terms are present, even though not adjacent.
-//
-// Example output:
-//
-//	{content exactMatchContent} : ("my" AND "todo") OR ("my"* AND "todo"*) OR ("my" AND "todo"*)
-//	{content exactMatchContent} : ("mytodo") OR ("mytodo"*)
-func buildMatchQuery(terms []string) string {
-	if len(terms) == 0 {
-		return ""
-	}
 
-	var quotedTerms []string
-	for _, term := range terms {
-		// Quote the term to avoid FTS5 bareword input sanitization.
-		// https://www.sqlite.org/fts5.html#fts5_strings
-		term = strings.ReplaceAll(term, "\"", " ")
-		quotedTerms = append(quotedTerms, fmt.Sprintf("%q", term))
-	}
-
-	// Create different permutations of the match query using AND to allow
-	// non-adjacent term matching. We use different combinations to give
-	// more weight (rank) to exact matches vs globbed matches:
-	// 1. Exact terms (highest rank)
-	// 2. Exact terms with last term globbed
-	// 3. All terms globbed (catches all matches)
-	var matchPhrases []string
-	if len(quotedTerms) == 1 {
-		// Single term - use simpler query without AND
-		matchPhrases = []string{
-			quotedTerms[0],       // '"term"'
-			quotedTerms[0] + "*", // '"term"*'
-		}
-	} else {
-		// Multiple terms - use AND to allow non-adjacent matching
-		// Create globbed versions of terms for partial matching
-		var globbedTerms []string
-		for _, term := range quotedTerms {
-			globbedTerms = append(globbedTerms, term+"*")
-		}
-		
-		// Create a mixed version: all terms globbed for best matching
-		// This ensures we match "Craft Workflow" against "Craft Alfred Workflow"
-		matchPhrases = []string{
-			strings.Join(globbedTerms, " AND "),      // '"term1"* AND "term2"*' (best for non-adjacent)
-			strings.Join(quotedTerms, " AND "),       // '"term1" AND "term2"' (exact match, higher rank)
-		}
-	}
-
-	matchQuery := fmt.Sprintf("{content exactMatchContent} : (%s)", strings.Join(matchPhrases, ") OR ("))
-
-	return matchQuery
-}
 
 func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []string, limit int) (*sql.Rows, error) {
-	// Build LIKE query for fallback when FTS5 is not available
+	// Build LIKE query for searching content
 	// Try multiple table names in case the structure varies
-	tableNames := []string{"BlockSearch_content", "BlockSearch"}
+	tableNames := []string{"BlockSearch_content"}
 
 	for _, tableName := range tableNames {
 		var query string
@@ -206,8 +148,7 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 }
 
 func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, daily bool, currentSpaceID string) ([]Block, error) {
-	matchQuery := buildMatchQuery(terms)
-	log.Printf("Searching with matchQuery: '%s'", matchQuery)
+	log.Printf("Searching with terms: %v", terms)
 
 	blocks := make([]Block, 0, searchResultLimit)
 
@@ -242,57 +183,11 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		}
 		log.Printf("Searching %s, limit %d", space.ID, limit)
 
-		var rows *sql.Rows
-		var err error
-		if len(matchQuery) > 0 {
-			// Try FTS5 first, with error handling
-			query := `
-				SELECT id, content, entityType, documentId
-				FROM BlockSearch(?)
-				ORDER BY rank + customRank
-				LIMIT ?
-			`
-			rows, err = space.DB.QueryContext(ctx, query, matchQuery, limit)
-			if err != nil {
-				log.Printf("FTS5 query failed: %v", err)
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "no such module: fts5") || strings.Contains(errMsg, "no such table") {
-					log.Printf("FTS5 not available, falling back to LIKE search")
-					rows, err = b.searchWithLike(ctx, space, terms, limit)
-					if err != nil {
-						log.Printf("LIKE search also failed: %v", err)
-						return nil, types.NewError("failed to query database search", err)
-					}
-				} else {
-					return nil, types.NewError("failed to query database search", err)
-				}
-			}
-		} else {
-			// No search terms were provided, fallback to listing
-			// all results according to whatever custom rank Craft
-			// has assigned them. Documents have a much lower
-			// customRank than blocks, so with 40+ documents all
-			// results will be documents. The results seems to be
-			// sorted in an order approximating recently accessed,
-			// edited or created.
-			query := "SELECT id, content, entityType, documentId FROM BlockSearch ORDER BY customRank LIMIT ?"
-			rows, err = space.DB.QueryContext(ctx, query, limit)
-			if err != nil {
-				// FTS5 not available, use fallback
-				if strings.Contains(err.Error(), "no such module: fts5") || strings.Contains(err.Error(), "no such table") {
-					log.Printf("FTS5 not available for empty search, falling back to LIKE search")
-					rows, err = b.searchWithLike(ctx, space, terms, limit)
-					if err != nil {
-						log.Printf("LIKE search also failed: %v", err)
-						return nil, types.NewError("failed to query database search", err)
-					}
-				} else {
-					return nil, types.NewError("failed to query database", err)
-				}
-			}
-		}
+		// Use LIKE-based search for all queries
+		rows, err := b.searchWithLike(ctx, space, terms, limit)
 		if err != nil {
-			return nil, types.NewError("failed to query database", err)
+			log.Printf("LIKE search failed: %v", err)
+			return nil, types.NewError("failed to query database search", err)
 		}
 
 		for rows.Next() {
@@ -348,19 +243,11 @@ func (b *BlockRepo) BackfillDocumentNames(ctx context.Context, blocks []Block, t
 			placeholders = append(placeholders, "?"+strconv.Itoa(len(ids)))
 		}
 
-		query := `select documentId, content from BlockSearch where entityType = 'document' and documentId in (` + strings.Join(placeholders, ", ") + ")"
+		// Use BlockSearch_content table directly (no FTS5)
+		query := `select c7 as documentId, c1 as content from BlockSearch_content where c3 = 'document' and c7 in (` + strings.Join(placeholders, ", ") + ")"
 		rows, err := space.DB.QueryContext(ctx, query, ids...)
 		if err != nil {
-			// Try fallback table if BlockSearch fails (FTS5 not available)
-			if strings.Contains(err.Error(), "no such module: fts5") || strings.Contains(err.Error(), "no such table") {
-				query = `select c7 as documentId, c1 as content from BlockSearch_content where c3 = 'document' and c7 in (` + strings.Join(placeholders, ", ") + ")"
-				rows, err = space.DB.QueryContext(ctx, query, ids...)
-				if err != nil {
-					return nil, types.NewError("failed to query the database", err)
-				}
-			} else {
-				return nil, types.NewError("failed to query the database", err)
-			}
+			return nil, types.NewError("failed to query the database", err)
 		}
 
 		for rows.Next() {
