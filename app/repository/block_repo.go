@@ -98,12 +98,14 @@ func (b *BlockRepo) filterDateTitles(blocks []Block, daily bool) []Block {
 // and exactMatchContent (only set for documents). Content is used for
 // regular full-text search and including exactMatchContent allows for
 // searches like "mylist" that will match a document named "My List".
-// This works slightly better than in Craft since we're "globbing" the
-// term so that it will also match "My List Of Things" (unlike Craft).
+//
+// The query uses AND to match all terms independently, allowing non-adjacent
+// matches. For example, searching "craft workflow" will match "Craft Alfred Workflow"
+// because both terms are present, even though not adjacent.
 //
 // Example output:
 //
-//	{content exactMatchContent} : ("my" "todo") OR ("my" "todo"*) OR ("my"* "todo"*)
+//	{content exactMatchContent} : ("my" AND "todo") OR ("my"* AND "todo"*) OR ("my" AND "todo"*)
 //	{content exactMatchContent} : ("mytodo") OR ("mytodo"*)
 func buildMatchQuery(terms []string) string {
 	if len(terms) == 0 {
@@ -117,30 +119,34 @@ func buildMatchQuery(terms []string) string {
 		term = strings.ReplaceAll(term, "\"", " ")
 		quotedTerms = append(quotedTerms, fmt.Sprintf("%q", term))
 	}
-	// Create different permutations of the match phrase (with and
-	// without "globbing") in an attempt to give more weight (rank)
-	// to non-"globbed" terms. The last form where every term is
-	// followed by * will return all results, however, including the
-	// former increases the weight of more exact results and more
-	// closely matches the search results produced by Craft.
-	//
-	// Further permutations can include + between terms which
-	// matches terms immediately following each other, but this does
-	// not seem to affect the weights too much.
-	//
-	// In many cases, this matches the results returned by Craft but
-	// often something can be slightly out of order. Without knowing
-	// the exact sort criteria used in Craft we'll have to settle
-	// for "good enough". For example, they could be using create or
-	// modification date or frequency of access which we do not have
-	// access to.
-	matchPhrases := []string{
-		strings.Join(quotedTerms, " "),       // '"term1" "term2"'
-		strings.Join(quotedTerms, " ") + "*", // '"term1" "term2"*'
-	}
-	// Avoid unnecessarily repeating the result produced previously.
-	if len(quotedTerms) > 1 {
-		matchPhrases = append(matchPhrases, strings.Join(quotedTerms, "* ")+"*") // '"term1"* "term2"*'
+
+	// Create different permutations of the match query using AND to allow
+	// non-adjacent term matching. We use different combinations to give
+	// more weight (rank) to exact matches vs globbed matches:
+	// 1. Exact terms (highest rank)
+	// 2. Exact terms with last term globbed
+	// 3. All terms globbed (catches all matches)
+	var matchPhrases []string
+	if len(quotedTerms) == 1 {
+		// Single term - use simpler query without AND
+		matchPhrases = []string{
+			quotedTerms[0],       // '"term"'
+			quotedTerms[0] + "*", // '"term"*'
+		}
+	} else {
+		// Multiple terms - use AND to allow non-adjacent matching
+		// Create globbed versions of terms for partial matching
+		var globbedTerms []string
+		for _, term := range quotedTerms {
+			globbedTerms = append(globbedTerms, term+"*")
+		}
+		
+		// Create a mixed version: all terms globbed for best matching
+		// This ensures we match "Craft Workflow" against "Craft Alfred Workflow"
+		matchPhrases = []string{
+			strings.Join(globbedTerms, " AND "),      // '"term1"* AND "term2"*' (best for non-adjacent)
+			strings.Join(quotedTerms, " AND "),       // '"term1" AND "term2"' (exact match, higher rank)
+		}
 	}
 
 	matchQuery := fmt.Sprintf("{content exactMatchContent} : (%s)", strings.Join(matchPhrases, ") OR ("))

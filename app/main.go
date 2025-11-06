@@ -53,7 +53,13 @@ func flow(ctx context.Context, args []string, allSpaces bool, daily bool, curren
 
 	defer func() { _ = blockService.Close() }()
 
-	blocks, err := blockService.Search(ctx, args, allSpaces, daily, currentSpaceID)
+	// Split search terms by whitespace to enable non-adjacent matching
+	var searchTerms []string
+	for _, arg := range args {
+		searchTerms = append(searchTerms, strings.Fields(arg)...)
+	}
+
+	blocks, err := blockService.Search(ctx, searchTerms, allSpaces, daily, currentSpaceID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("search: %w", err)
 	}
