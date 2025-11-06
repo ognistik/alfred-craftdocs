@@ -45,7 +45,7 @@ func initialize() (*config.Config, *service.BlockService, string, error) {
 	return cfg, blockService, "", nil
 }
 
-func flow(ctx context.Context, args []string, allSpaces bool, currentSpaceID string) (*config.Config, []repository.Block, error) {
+func flow(ctx context.Context, args []string, allSpaces bool, daily bool, currentSpaceID string) (*config.Config, []repository.Block, error) {
 	cfg, blockService, _, err := initialize()
 	if err != nil {
 		return nil, nil, fmt.Errorf("initialize: %w", err)
@@ -53,7 +53,7 @@ func flow(ctx context.Context, args []string, allSpaces bool, currentSpaceID str
 
 	defer func() { _ = blockService.Close() }()
 
-	blocks, err := blockService.Search(ctx, args, allSpaces, currentSpaceID)
+	blocks, err := blockService.Search(ctx, args, allSpaces, daily, currentSpaceID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("search: %w", err)
 	}
@@ -85,7 +85,8 @@ func main() {
 	// Read from Alfred's JSON input or environment variable
 	allSpacesStr := os.Getenv("allSpaces")
 	primarySpaceStr := os.Getenv("primarySpace")
-	if allSpacesStr == "" || primarySpaceStr == "" {
+	dailyStr := os.Getenv("daily")
+	if allSpacesStr == "" || primarySpaceStr == "" || dailyStr == "" {
 		// Try to read from Alfred's stdin JSON (workflow variables)
 		if jsonBytes, err := io.ReadAll(os.Stdin); err == nil {
 			var alfredInput struct {
@@ -98,11 +99,15 @@ func main() {
 				if primarySpaceStr == "" {
 					primarySpaceStr = alfredInput.Variables["primarySpace"]
 				}
+				if dailyStr == "" {
+					dailyStr = alfredInput.Variables["daily"]
+				}
 			}
 		}
 	}
 	allSpaces := allSpacesStr == "1"
-	log.Printf("Search scope: allSpaces=%t (raw: '%s'), primarySpace='%s'", allSpaces, allSpacesStr, primarySpaceStr)
+	daily := dailyStr == "1"
+	log.Printf("Search scope: allSpaces=%t (raw: '%s'), primarySpace='%s', daily=%t (raw: '%s')", allSpaces, allSpacesStr, primarySpaceStr, daily, dailyStr)
 
 	cfg, blockService, _, err := initialize()
 	if err != nil {
@@ -125,7 +130,7 @@ func main() {
 		log.Printf("Searching all spaces")
 	}
 
-	config, blocks, err := flow(context.Background(), os.Args[1:], allSpaces, currentSpaceID)
+	config, blocks, err := flow(context.Background(), os.Args[1:], allSpaces, daily, currentSpaceID)
 	if err != nil {
 		var te types.Error
 		if errors.As(err, &te) {

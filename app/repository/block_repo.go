@@ -74,12 +74,13 @@ func isDigits(s string) bool {
 }
 
 // filterDateTitles removes documents with date-like titles and returns exactly searchResultLimit items
-func (b *BlockRepo) filterDateTitles(blocks []Block) []Block {
+// If daily is true, date-titled documents are included in results
+func (b *BlockRepo) filterDateTitles(blocks []Block, daily bool) []Block {
 	filtered := make([]Block, 0, len(blocks))
 
 	for _, block := range blocks {
-		// Skip documents with date-like titles
-		if block.IsDocument() && isDateTitle(block.Content) {
+		// Skip documents with date-like titles only if daily is false
+		if !daily && block.IsDocument() && isDateTitle(block.Content) {
 			continue
 		}
 		filtered = append(filtered, block)
@@ -198,7 +199,7 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 	return space.DB.QueryContext(ctx, "SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content LIMIT ?", limit)
 }
 
-func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, currentSpaceID string) ([]Block, error) {
+func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, daily bool, currentSpaceID string) ([]Block, error) {
 	matchQuery := buildMatchQuery(terms)
 	log.Printf("Searching with matchQuery: '%s'", matchQuery)
 
@@ -307,7 +308,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		}
 	}
 
-	return b.filterDateTitles(blocks), nil
+	return b.filterDateTitles(blocks, daily), nil
 }
 
 type docKey struct {

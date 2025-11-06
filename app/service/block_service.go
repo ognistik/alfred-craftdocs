@@ -19,8 +19,8 @@ func NewBlockService(br *repository.BlockRepo) *BlockService {
 	return &BlockService{br: br}
 }
 
-func (r *BlockService) Search(ctx context.Context, args []string, allSpaces bool, currentSpaceID string) ([]repository.Block, error) {
-	blocks, err := r.br.Search(ctx, args, allSpaces, currentSpaceID)
+func (r *BlockService) Search(ctx context.Context, args []string, allSpaces bool, daily bool, currentSpaceID string) ([]repository.Block, error) {
+	blocks, err := r.br.Search(ctx, args, allSpaces, daily, currentSpaceID)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
