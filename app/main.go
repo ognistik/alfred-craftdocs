@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 
 	aw "github.com/deanishe/awgo"
@@ -152,17 +151,8 @@ func main() {
 		addCreateNewDocument(wf, config, os.Args[1:])
 	}
 
-	// Sort all documents (across spaces) on top, whilst maintaining
-	// order, primary space documents will always be on top.
-	sort.SliceStable(blocks, func(i, j int) bool {
-		if blocks[i].IsDocument() && !blocks[j].IsDocument() {
-			return true
-		}
-		if !blocks[i].IsDocument() && blocks[j].IsDocument() {
-			return false
-		}
-		return i < j
-	})
+	// Note: Blocks are now pre-sorted by fuzzy search scoring in block_repo.go
+	// Documents are automatically prioritized when match quality is equal
 
 	newDocumentEntryAdded := false
 	for _, block := range blocks {
@@ -186,11 +176,13 @@ func main() {
 			}
 		}
 
+		// Create Alfred item with Large Text support
 		wf.
 			NewItem(block.Content).
 			Subtitle(block.DocumentName).
 			UID(block.ID).
 			Arg("craftdocs://open?blockId=" + block.ID + "&spaceId=" + urlSpaceID).
+			Largetype(block.Content).
 			Valid(true)
 	}
 }
