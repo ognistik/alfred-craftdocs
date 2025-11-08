@@ -168,14 +168,17 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 			query = fmt.Sprintf(`
 				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId 
 				FROM %s 
-				WHERE c3 = 'document'
+				WHERE c3 = 'document' AND c1 IS NOT NULL AND length(c1) > 0
 				ORDER BY c0 DESC
 				LIMIT ?
 			`, tableName)
 			args = []interface{}{limit}
 		} else {
-			conditions := make([]string, 0, len(terms))
+			conditions := make([]string, 0, len(terms)+1)
 			args = make([]interface{}, 0, len(terms)+1)
+
+			// Filter out empty content
+			conditions = append(conditions, "c1 IS NOT NULL AND length(c1) > 0")
 
 			for _, term := range terms {
 				conditions = append(conditions, "c1 LIKE ?") // c1 contains the content
@@ -203,7 +206,7 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 
 	// If both table attempts fail, try a simpler approach
 	log.Printf("All LIKE queries failed, trying basic search")
-	return space.DB.QueryContext(ctx, "SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content LIMIT ?", limit)
+	return space.DB.QueryContext(ctx, "SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content WHERE c1 IS NOT NULL AND length(c1) > 0 LIMIT ?", limit)
 }
 
 func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, daily bool, currentSpaceID string) ([]Block, error) {
