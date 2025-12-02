@@ -14,7 +14,7 @@ import (
 
 const (
 	// Fetch more results for better fuzzy matching (similar to Bear workflow)
-	searchFetchLimit = 200
+	searchFetchLimit = 1000
 	// Display limit for final results
 	searchResultLimit = 40
 )
@@ -57,12 +57,13 @@ func (b *Block) IsDocument() bool {
 
 // blockRecord holds a block along with its match quality scores
 type blockRecord struct {
-	block                Block
-	isDocument           bool
-	exactMatch           bool // title contains exact search phrase
-	orderedWordsMatch    bool // title contains all words in order
-	allWordsMatch        bool // title contains all words (any order)
-	originalIndex        int
+	block             Block
+	isDocument        bool
+	exactMatch        bool // title contains exact search phrase
+	prefixMatch       bool // title starts with the search phrase
+	orderedWordsMatch bool // title contains all words in order
+	allWordsMatch     bool // title contains all words (any order)
+	originalIndex     int
 }
 
 // isDateTitle checks if the content matches the date pattern YYYY.MM.DD
@@ -111,14 +112,16 @@ func containsAllWords(text string, words []string) bool {
 // scoreBlock creates a blockRecord with match quality scores for the given block
 func scoreBlock(block Block, searchPhrase string, searchWords []string, index int) blockRecord {
 	lowerContent := strings.ToLower(block.Content)
-	
+
 	record := blockRecord{
-		block:         block,
-		isDocument:    block.IsDocument(),
-		exactMatch:    strings.Contains(lowerContent, searchPhrase),
+		block:      block,
+		isDocument: block.IsDocument(),
+		exactMatch: strings.Contains(lowerContent, searchPhrase),
+		// strong signal for short queries like "any" -> "anytime"
+		prefixMatch:   strings.HasPrefix(lowerContent, searchPhrase),
 		originalIndex: index,
 	}
-	
+
 	if len(searchWords) > 1 {
 		record.orderedWordsMatch = containsOrderedWords(lowerContent, searchWords)
 		record.allWordsMatch = containsAllWords(lowerContent, searchWords)
@@ -127,7 +130,7 @@ func scoreBlock(block Block, searchPhrase string, searchWords []string, index in
 		record.orderedWordsMatch = record.exactMatch
 		record.allWordsMatch = record.exactMatch
 	}
-	
+
 	return record
 }
 
@@ -209,6 +212,59 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 	return space.DB.QueryContext(ctx, "SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content WHERE c1 IS NOT NULL AND length(c1) > 0 LIMIT ?", limit)
 }
 
+func (b *BlockRepo) searchDocumentsWithLike(ctx context.Context, space Space, terms []string, limit int) (*sql.Rows, error) {
+	tableNames := []string{"BlockSearch_content"}
+
+	for _, tableName := range tableNames {
+		var query string
+		var args []interface{}
+
+		if len(terms) == 0 {
+			// Recent documents only
+			query = fmt.Sprintf(`
+				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId
+				FROM %s
+				WHERE c3 = 'document' AND c1 IS NOT NULL AND length(c1) > 0
+				ORDER BY c0 DESC
+				LIMIT ?
+			`, tableName)
+			args = []interface{}{limit}
+		} else {
+			conditions := make([]string, 0, len(terms)+2)
+			args = make([]interface{}, 0, len(terms)+2)
+
+			conditions = append(conditions, "c3 = 'document'")
+			conditions = append(conditions, "c1 IS NOT NULL AND length(c1) > 0")
+
+			for _, term := range terms {
+				conditions = append(conditions, "c1 LIKE ?")
+				args = append(args, "%"+term+"%")
+			}
+
+			whereClause := strings.Join(conditions, " AND ")
+			query = fmt.Sprintf(`
+				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId
+				FROM %s
+				WHERE %s
+				ORDER BY c0 DESC
+				LIMIT ?
+			`, tableName, whereClause)
+			args = append(args, limit)
+		}
+
+		log.Printf("Trying document-only LIKE query on %s: %s, args: %v", tableName, query, args)
+
+		rows, err := space.DB.QueryContext(ctx, query, args...)
+		if err == nil {
+			return rows, nil
+		}
+		log.Printf("Document-only LIKE query on %s failed: %v", tableName, err)
+	}
+
+	log.Printf("All document-only LIKE queries failed, falling back to generic searchWithLike")
+	return b.searchWithLike(ctx, space, terms, limit)
+}
+
 func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, daily bool, currentSpaceID string) ([]Block, error) {
 	log.Printf("Searching with terms: %v", terms)
 
@@ -280,7 +336,38 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 	// First pass: search for full phrase
 	if len(terms) > 0 {
 		for _, space := range spacesToSearch {
-			log.Printf("Searching %s for full phrase, limit %d", space.ID, searchFetchLimit)
+			// 1) Documents first
+			log.Printf("Searching %s for documents with full phrase, limit %d", space.ID, searchFetchLimit)
+
+			docRows, err := b.searchDocumentsWithLike(ctx, space, terms, searchFetchLimit)
+			if err != nil {
+				log.Printf("Document LIKE search failed: %v", err)
+				return nil, types.NewError("failed to query database search for documents", err)
+			}
+
+			for docRows.Next() {
+				block := Block{SpaceID: space.ID}
+
+				if err = docRows.Scan(&block.ID, &block.Content, &block.EntityType, &block.DocumentID); err != nil {
+					return nil, types.NewError("failed to scan a document row", err)
+				}
+
+				if !seenIDs[block.ID] {
+					allBlocks = append(allBlocks, block)
+					seenIDs[block.ID] = true
+				}
+			}
+
+			if err = docRows.Err(); err != nil {
+				return nil, types.NewError("error in document rows", err)
+			}
+
+			if err = docRows.Close(); err != nil {
+				return nil, types.NewError("closing document rows failed", err)
+			}
+
+			// 2) Then generic (docs + blocks)
+			log.Printf("Searching %s for full phrase (all entities), limit %d", space.ID, searchFetchLimit)
 
 			rows, err := b.searchWithLike(ctx, space, terms, searchFetchLimit)
 			if err != nil {
@@ -363,39 +450,37 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		}
 	}
 
-	// Sort by match quality (similar to Bear workflow)
+	// Sort by match strength first, then gently prefer documents
 	sort.SliceStable(records, func(i, j int) bool {
 		iRecord := records[i]
 		jRecord := records[j]
 
-		// Prioritize documents over blocks when match quality is equal
+		// 1) Strong text signal: prefix match wins (regardless of doc/block)
+		if iRecord.prefixMatch != jRecord.prefixMatch {
+			return iRecord.prefixMatch
+		}
+
+		// 2) Exact phrase match
 		if iRecord.exactMatch != jRecord.exactMatch {
 			return iRecord.exactMatch
 		}
-		if iRecord.exactMatch && iRecord.isDocument != jRecord.isDocument {
-			return iRecord.isDocument
-		}
 
+		// 3) Ordered words
 		if iRecord.orderedWordsMatch != jRecord.orderedWordsMatch {
 			return iRecord.orderedWordsMatch
 		}
-		if iRecord.orderedWordsMatch && iRecord.isDocument != jRecord.isDocument {
-			return iRecord.isDocument
-		}
 
+		// 4) All words
 		if iRecord.allWordsMatch != jRecord.allWordsMatch {
 			return iRecord.allWordsMatch
 		}
-		if iRecord.allWordsMatch && iRecord.isDocument != jRecord.isDocument {
-			return iRecord.isDocument
-		}
 
-		// If match quality is equal, prioritize documents
+		// 5) At this point, match quality is similar → gently prefer documents
 		if iRecord.isDocument != jRecord.isDocument {
 			return iRecord.isDocument
 		}
 
-		// Fall back to original order (which is based on modification date from DB)
+		// 6) Stable fallback
 		return iRecord.originalIndex < jRecord.originalIndex
 	})
 
