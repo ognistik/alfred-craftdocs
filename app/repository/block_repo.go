@@ -63,6 +63,7 @@ type blockRecord struct {
 	prefixMatch       bool // title starts with the search phrase
 	orderedWordsMatch bool // title contains all words in order
 	allWordsMatch     bool // title contains all words (any order)
+	acronymMatch      bool // "ytv" vs "yt video"
 	originalIndex     int
 }
 
@@ -117,8 +118,7 @@ func scoreBlock(block Block, searchPhrase string, searchWords []string, index in
 		block:      block,
 		isDocument: block.IsDocument(),
 		exactMatch: strings.Contains(lowerContent, searchPhrase),
-		// strong signal for short queries like "any" -> "anytime"
-		prefixMatch:   strings.HasPrefix(lowerContent, searchPhrase),
+		prefixMatch: strings.HasPrefix(lowerContent, searchPhrase),
 		originalIndex: index,
 	}
 
@@ -126,9 +126,19 @@ func scoreBlock(block Block, searchPhrase string, searchWords []string, index in
 		record.orderedWordsMatch = containsOrderedWords(lowerContent, searchWords)
 		record.allWordsMatch = containsAllWords(lowerContent, searchWords)
 	} else {
-		// Single word search - exact match is the same as ordered/all words match
 		record.orderedWordsMatch = record.exactMatch
 		record.allWordsMatch = record.exactMatch
+	}
+
+	if len(searchPhrase) > 0 {
+		normTitle := normalizeAlnumLower(lowerContent)
+		normQuery := normalizeAlnumLower(searchPhrase)
+
+		if isSubsequence(normTitle, normQuery) {
+			record.acronymMatch = true
+		} else if isSubsequence(initials(block.Content), normQuery) {
+			record.acronymMatch = true
+		}
 	}
 
 	return record
@@ -155,11 +165,52 @@ func (b *BlockRepo) filterDateTitles(blocks []Block, daily bool) []Block {
 	return filtered
 }
 
+func normalizeAlnumLower(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
 
+	for _, r := range s {
+		// Normalize to lowercase first
+		if r >= 'A' && r <= 'Z' {
+			r = r + ('a' - 'A')
+		}
+
+		// Keep only [a-z0-9]
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+
+	return b.String()
+}
+
+func isSubsequence(text, pattern string) bool {
+	if len(pattern) == 0 {
+		return true
+	}
+	ti, pi := 0, 0
+	for ti < len(text) && pi < len(pattern) {
+		if text[ti] == pattern[pi] {
+			pi++
+		}
+		ti++
+	}
+	return pi == len(pattern)
+}
+
+func initials(s string) string {
+	parts := strings.Fields(s)
+	var b strings.Builder
+	b.Grow(len(parts))
+	for _, p := range parts {
+		if len(p) > 0 {
+			b.WriteByte(byte(strings.ToLower(p)[0]))
+		}
+	}
+	return b.String()
+}
 
 func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []string, limit int) (*sql.Rows, error) {
-	// Build LIKE query for searching content
-	// Try multiple table names in case the structure varies
 	tableNames := []string{"BlockSearch_content"}
 
 	for _, tableName := range tableNames {
@@ -171,7 +222,7 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 			query = fmt.Sprintf(`
 				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId 
 				FROM %s 
-				WHERE c3 = 'document' AND c1 IS NOT NULL AND length(c1) > 0
+				WHERE c1 IS NOT NULL AND length(c1) > 0
 				ORDER BY c0 DESC
 				LIMIT ?
 			`, tableName)
@@ -184,8 +235,9 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 			conditions = append(conditions, "c1 IS NOT NULL AND length(c1) > 0")
 
 			for _, term := range terms {
-				conditions = append(conditions, "c1 LIKE ?") // c1 contains the content
-				args = append(args, "%"+term+"%")
+				lterm := strings.ToLower(term)
+				conditions = append(conditions, "LOWER(c1) LIKE ?") // case-insensitive
+				args = append(args, "%"+lterm+"%")
 			}
 
 			whereClause := strings.Join(conditions, " AND ")
@@ -207,9 +259,11 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 		log.Printf("LIKE query on %s failed: %v", tableName, err)
 	}
 
-	// If both table attempts fail, try a simpler approach
 	log.Printf("All LIKE queries failed, trying basic search")
-	return space.DB.QueryContext(ctx, "SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content WHERE c1 IS NOT NULL AND length(c1) > 0 LIMIT ?", limit)
+	return space.DB.QueryContext(ctx,
+		"SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId FROM BlockSearch_content WHERE c1 IS NOT NULL AND length(c1) > 0 LIMIT ?",
+		limit,
+	)
 }
 
 func (b *BlockRepo) searchDocumentsWithLike(ctx context.Context, space Space, terms []string, limit int) (*sql.Rows, error) {
@@ -237,8 +291,9 @@ func (b *BlockRepo) searchDocumentsWithLike(ctx context.Context, space Space, te
 			conditions = append(conditions, "c1 IS NOT NULL AND length(c1) > 0")
 
 			for _, term := range terms {
-				conditions = append(conditions, "c1 LIKE ?")
-				args = append(args, "%"+term+"%")
+				lterm := strings.ToLower(term)
+				conditions = append(conditions, "LOWER(c1) LIKE ?")
+				args = append(args, "%"+lterm+"%")
 			}
 
 			whereClause := strings.Join(conditions, " AND ")
@@ -333,13 +388,21 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		searchWords[i] = strings.ToLower(term)
 	}
 
+	// Decide what to send to SQL
+	sqlTerms := terms
+	if len(terms) == 1 {
+		// Single-token search: do NOT constrain SQL by LIKE.
+		// Fetch broadly and let fuzzy scorer (prefix/acronym/etc.) do the ranking.
+		sqlTerms = []string{}
+	}
+
 	// First pass: search for full phrase
 	if len(terms) > 0 {
 		for _, space := range spacesToSearch {
 			// 1) Documents first
 			log.Printf("Searching %s for documents with full phrase, limit %d", space.ID, searchFetchLimit)
 
-			docRows, err := b.searchDocumentsWithLike(ctx, space, terms, searchFetchLimit)
+			docRows, err := b.searchDocumentsWithLike(ctx, space, sqlTerms, searchFetchLimit)
 			if err != nil {
 				log.Printf("Document LIKE search failed: %v", err)
 				return nil, types.NewError("failed to query database search for documents", err)
@@ -369,7 +432,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 			// 2) Then generic (docs + blocks)
 			log.Printf("Searching %s for full phrase (all entities), limit %d", space.ID, searchFetchLimit)
 
-			rows, err := b.searchWithLike(ctx, space, terms, searchFetchLimit)
+			rows, err := b.searchWithLike(ctx, space, sqlTerms, searchFetchLimit)
 			if err != nil {
 				log.Printf("LIKE search failed: %v", err)
 				return nil, types.NewError("failed to query database search", err)
@@ -434,6 +497,52 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		}
 	}
 
+	// If LIKE-based search returned nothing, do a broad fetch and rely on fuzzy scoring
+	if len(allBlocks) == 0 {
+		log.Printf("No results from LIKE search, falling back to broad fuzzy search")
+
+		for _, space := range spacesToSearch {
+			// Documents first
+			docRows, err := b.searchDocumentsWithLike(ctx, space, []string{}, searchFetchLimit)
+			if err != nil {
+				log.Printf("Broad document fetch failed: %v", err)
+				continue
+			}
+
+			for docRows.Next() {
+				block := Block{SpaceID: space.ID}
+				if err = docRows.Scan(&block.ID, &block.Content, &block.EntityType, &block.DocumentID); err != nil {
+					return nil, types.NewError("failed to scan a document row (fallback)", err)
+				}
+				if !seenIDs[block.ID] {
+					allBlocks = append(allBlocks, block)
+					seenIDs[block.ID] = true
+				}
+			}
+			_ = docRows.Close()
+
+			// Optionally, also fetch recent blocks if you want more context,
+			// but often docs are enough for fuzzy title matching:
+			rows, err := b.searchWithLike(ctx, space, []string{}, searchFetchLimit)
+			if err != nil {
+				log.Printf("Broad generic fetch failed: %v", err)
+				continue
+			}
+
+			for rows.Next() {
+				block := Block{SpaceID: space.ID}
+				if err = rows.Scan(&block.ID, &block.Content, &block.EntityType, &block.DocumentID); err != nil {
+					return nil, types.NewError("failed to scan a row (fallback)", err)
+				}
+				if !seenIDs[block.ID] {
+					allBlocks = append(allBlocks, block)
+					seenIDs[block.ID] = true
+				}
+			}
+			_ = rows.Close()
+		}
+	}
+
 	// Score and rank all blocks
 	records := make([]blockRecord, 0, len(allBlocks))
 	for i, block := range allBlocks {
@@ -450,14 +559,47 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		}
 	}
 
-	// Sort by match strength first, then gently prefer documents
+	// Sort by match strength first, with strong bias towards document title matches
 	sort.SliceStable(records, func(i, j int) bool {
 		iRecord := records[i]
 		jRecord := records[j]
 
-		// 1) Strong text signal: prefix match wins (regardless of doc/block)
+		// 0) Acronym / subsequence signal
+		if iRecord.acronymMatch != jRecord.acronymMatch {
+			return iRecord.acronymMatch
+		}
+		if iRecord.acronymMatch && jRecord.acronymMatch {
+			// Both have acronym match → prefer document
+			if iRecord.isDocument != jRecord.isDocument {
+				return iRecord.isDocument
+			}
+		}
+
+		// 1) Strongest: document whose title starts with the search phrase
 		if iRecord.prefixMatch != jRecord.prefixMatch {
-			return iRecord.prefixMatch
+			// One has prefixMatch, the other doesn't
+			if iRecord.prefixMatch && !jRecord.prefixMatch {
+				// If i is a document and j is not, push i up
+				if iRecord.isDocument && !jRecord.isDocument {
+					return true
+				}
+				// Otherwise still prefer the prefix match
+				return true
+			}
+			if !iRecord.prefixMatch && jRecord.prefixMatch {
+				if jRecord.isDocument && !iRecord.isDocument {
+					return false
+				}
+				return false
+			}
+		}
+
+		// Both prefixMatch == true or both == false
+		if iRecord.prefixMatch && jRecord.prefixMatch {
+			// Both have prefixMatch → prefer documents
+			if iRecord.isDocument != jRecord.isDocument {
+				return iRecord.isDocument
+			}
 		}
 
 		// 2) Exact phrase match
@@ -475,7 +617,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 			return iRecord.allWordsMatch
 		}
 
-		// 5) At this point, match quality is similar → gently prefer documents
+		// 5) Prefer documents (general)
 		if iRecord.isDocument != jRecord.isDocument {
 			return iRecord.isDocument
 		}
