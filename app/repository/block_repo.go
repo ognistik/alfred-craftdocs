@@ -55,16 +55,20 @@ func (b *Block) IsDocument() bool {
 	return b.EntityType == "document"
 }
 
-// blockRecord holds a block along with its match quality scores
 type blockRecord struct {
-	block             Block
-	isDocument        bool
-	exactMatch        bool // title contains exact search phrase
-	prefixMatch       bool // title starts with the search phrase
-	orderedWordsMatch bool // title contains all words in order
-	allWordsMatch     bool // title contains all words (any order)
-	acronymMatch      bool // "ytv" vs "yt video"
-	originalIndex     int
+	block                        Block
+	isDocument                   bool
+	exactMatch                   bool // title contains exact search phrase
+	prefixMatch                  bool // title starts with the search phrase
+	orderedWordsMatch            bool // title contains all words in order
+	allWordsMatch                bool // title contains all words (any order)
+	acronymMatch                 bool // "ytv" vs "yt video"
+	documentTitleRelevant        bool // true if this is a document and its title contains any of the search words
+	containsAnySearchWord        bool // true if this block's content contains at least one of the search words
+	parentDocumentID             string // Stores the DocumentID of the block's parent document (or itself if it's a document block)
+	parentDocumentWasTopRanked  bool   // true if its parent (or itself if a document) was identified as highly relevant
+	docAndBlockAllWordsMatch    bool   // true if document title + this block together contain all search words
+	originalIndex                int
 }
 
 // isDateTitle checks if the content matches the date pattern YYYY.MM.DD
@@ -100,6 +104,15 @@ func containsOrderedWords(text string, words []string) bool {
 	return true
 }
 
+func allTrue(flags []bool) bool {
+	for _, f := range flags {
+		if !f {
+			return false
+		}
+	}
+	return true
+}
+
 // containsAllWords checks if text contains all the given words (in any order)
 func containsAllWords(text string, words []string) bool {
 	for _, word := range words {
@@ -115,19 +128,39 @@ func scoreBlock(block Block, searchPhrase string, searchWords []string, index in
 	lowerContent := strings.ToLower(block.Content)
 
 	record := blockRecord{
-		block:      block,
-		isDocument: block.IsDocument(),
-		exactMatch: strings.Contains(lowerContent, searchPhrase),
-		prefixMatch: strings.HasPrefix(lowerContent, searchPhrase),
-		originalIndex: index,
+		block:                       block,
+		isDocument:                  block.IsDocument(),
+		exactMatch:                  strings.Contains(lowerContent, searchPhrase),
+		prefixMatch:                 strings.HasPrefix(lowerContent, searchPhrase),
+		parentDocumentID:            block.DocumentID, // Set parentDocumentID for all blocks
+		originalIndex:               index,
+	}
+
+	// NEW: Check if this block contains any of the search words
+	for _, word := range searchWords {
+		if strings.Contains(lowerContent, word) {
+			record.containsAnySearchWord = true
+			break
+		}
 	}
 
 	if len(searchWords) > 1 {
 		record.orderedWordsMatch = containsOrderedWords(lowerContent, searchWords)
 		record.allWordsMatch = containsAllWords(lowerContent, searchWords)
-	} else {
+	} else { // if only one search word, these are equivalent to exact match
 		record.orderedWordsMatch = record.exactMatch
 		record.allWordsMatch = record.exactMatch
+	}
+
+	// For document blocks, check if their title contains any search words
+	if record.isDocument {
+		lowerDocTitle := strings.ToLower(record.block.Content)
+		for _, word := range searchWords {
+			if strings.Contains(lowerDocTitle, word) {
+				record.documentTitleRelevant = true
+				break
+			}
+		}
 	}
 
 	if len(searchPhrase) > 0 {
@@ -234,13 +267,17 @@ func (b *BlockRepo) searchWithLike(ctx context.Context, space Space, terms []str
 			// Filter out empty content
 			conditions = append(conditions, "c1 IS NOT NULL AND length(c1) > 0")
 
+			// Use OR conditions for search terms to cast a wider net in SQL
+			termConditions := make([]string, 0, len(terms))
 			for _, term := range terms {
 				lterm := strings.ToLower(term)
-				conditions = append(conditions, "LOWER(c1) LIKE ?") // case-insensitive
+				termConditions = append(termConditions, "LOWER(c1) LIKE ?") // case-insensitive
 				args = append(args, "%"+lterm+"%")
 			}
+			conditions = append(conditions, "("+strings.Join(termConditions, " OR ")+")")
 
-			whereClause := strings.Join(conditions, " AND ")
+			whereClause := strings.Join(conditions, " AND ") // Combine general conditions with the OR-group of terms
+
 			query = fmt.Sprintf(`
 				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId 
 				FROM %s 
@@ -290,13 +327,17 @@ func (b *BlockRepo) searchDocumentsWithLike(ctx context.Context, space Space, te
 			conditions = append(conditions, "c3 = 'document'")
 			conditions = append(conditions, "c1 IS NOT NULL AND length(c1) > 0")
 
+			// Use OR conditions for search terms for document titles
+			termConditions := make([]string, 0, len(terms))
 			for _, term := range terms {
 				lterm := strings.ToLower(term)
-				conditions = append(conditions, "LOWER(c1) LIKE ?")
+				termConditions = append(termConditions, "LOWER(c1) LIKE ?")
 				args = append(args, "%"+lterm+"%")
 			}
+			conditions = append(conditions, "("+strings.Join(termConditions, " OR ")+")")
 
-			whereClause := strings.Join(conditions, " AND ")
+			whereClause := strings.Join(conditions, " AND ") // Combine general conditions with the OR-group of terms
+
 			query = fmt.Sprintf(`
 				SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId
 				FROM %s
@@ -377,7 +418,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 				return nil, types.NewError("closing rows failed", err)
 			}
 		}
-		
+
 		return b.filterDateTitles(allBlocks, daily), nil
 	}
 
@@ -388,12 +429,10 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		searchWords[i] = strings.ToLower(term)
 	}
 
-	// Decide what to send to SQL
-	sqlTerms := terms
-	if len(terms) == 1 {
-		// Single-token search: do NOT constrain SQL by LIKE.
-		// Fetch broadly and let fuzzy scorer (prefix/acronym/etc.) do the ranking.
-		sqlTerms = []string{}
+	// Build quick lookup for spaces by ID
+	spaceByID := make(map[string]Space, len(b.spaces))
+	for _, s := range b.spaces {
+		spaceByID[s.ID] = s
 	}
 
 	// First pass: search for full phrase
@@ -402,7 +441,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 			// 1) Documents first
 			log.Printf("Searching %s for documents with full phrase, limit %d", space.ID, searchFetchLimit)
 
-			docRows, err := b.searchDocumentsWithLike(ctx, space, sqlTerms, searchFetchLimit)
+			docRows, err := b.searchDocumentsWithLike(ctx, space, terms, searchFetchLimit)
 			if err != nil {
 				log.Printf("Document LIKE search failed: %v", err)
 				return nil, types.NewError("failed to query database search for documents", err)
@@ -432,7 +471,7 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 			// 2) Then generic (docs + blocks)
 			log.Printf("Searching %s for full phrase (all entities), limit %d", space.ID, searchFetchLimit)
 
-			rows, err := b.searchWithLike(ctx, space, sqlTerms, searchFetchLimit)
+			rows, err := b.searchWithLike(ctx, space, terms, searchFetchLimit)
 			if err != nil {
 				log.Printf("LIKE search failed: %v", err)
 				return nil, types.NewError("failed to query database search", err)
@@ -461,101 +500,159 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		}
 	}
 
-	// Second pass: search for individual words (for fuzzy matching)
-	if len(terms) > 1 {
-		for _, term := range terms {
-			for _, space := range spacesToSearch {
-				log.Printf("Searching %s for individual word %q", space.ID, term)
-
-				rows, err := b.searchWithLike(ctx, space, []string{term}, searchFetchLimit)
-				if err != nil {
-					log.Printf("LIKE search for word failed: %v", err)
-					continue
-				}
-
-				for rows.Next() {
-					block := Block{SpaceID: space.ID}
-
-					if err = rows.Scan(&block.ID, &block.Content, &block.EntityType, &block.DocumentID); err != nil {
-						return nil, types.NewError("failed to scan a row", err)
-					}
-
-					if !seenIDs[block.ID] {
-						allBlocks = append(allBlocks, block)
-						seenIDs[block.ID] = true
-					}
-				}
-
-				if err = rows.Err(); err != nil {
-					return nil, types.NewError("error in rows", err)
-				}
-
-				if err = rows.Close(); err != nil {
-					return nil, types.NewError("closing rows failed", err)
-				}
-			}
-		}
-	}
-
-	// If LIKE-based search returned nothing, do a broad fetch and rely on fuzzy scoring
-	if len(allBlocks) == 0 {
-		log.Printf("No results from LIKE search, falling back to broad fuzzy search")
-
-		for _, space := range spacesToSearch {
-			// Documents first
-			docRows, err := b.searchDocumentsWithLike(ctx, space, []string{}, searchFetchLimit)
-			if err != nil {
-				log.Printf("Broad document fetch failed: %v", err)
-				continue
-			}
-
-			for docRows.Next() {
-				block := Block{SpaceID: space.ID}
-				if err = docRows.Scan(&block.ID, &block.Content, &block.EntityType, &block.DocumentID); err != nil {
-					return nil, types.NewError("failed to scan a document row (fallback)", err)
-				}
-				if !seenIDs[block.ID] {
-					allBlocks = append(allBlocks, block)
-					seenIDs[block.ID] = true
-				}
-			}
-			_ = docRows.Close()
-
-			// Optionally, also fetch recent blocks if you want more context,
-			// but often docs are enough for fuzzy title matching:
-			rows, err := b.searchWithLike(ctx, space, []string{}, searchFetchLimit)
-			if err != nil {
-				log.Printf("Broad generic fetch failed: %v", err)
-				continue
-			}
-
-			for rows.Next() {
-				block := Block{SpaceID: space.ID}
-				if err = rows.Scan(&block.ID, &block.Content, &block.EntityType, &block.DocumentID); err != nil {
-					return nil, types.NewError("failed to scan a row (fallback)", err)
-				}
-				if !seenIDs[block.ID] {
-					allBlocks = append(allBlocks, block)
-					seenIDs[block.ID] = true
-				}
-			}
-			_ = rows.Close()
-		}
-	}
-
 	// Score and rank all blocks
 	records := make([]blockRecord, 0, len(allBlocks))
+	docHasRealTitle := make(map[docKey]bool) // tracks docs already present as real document blocks
+
+	// NEW: Declare highlyRelevantDocumentIDs here, before any 'if' blocks
+	highlyRelevantDocumentIDs := make(map[string]bool)
+
 	for i, block := range allBlocks {
 		record := scoreBlock(block, searchPhrase, searchWords, i)
-		
-		// Only include blocks that match all words (for multi-word searches)
-		if len(searchWords) > 1 {
-			if record.allWordsMatch {
-				records = append(records, record)
+		records = append(records, record)
+
+		if record.block.IsDocument() {
+			docHasRealTitle[docKey{spaceID: block.SpaceID, docID: block.DocumentID}] = true
+		}
+	}
+
+	// Build a map from documentID -> lowercased document title
+	docTitles := make(map[string]string)
+	for _, r := range records {
+		if r.isDocument && r.block.DocumentID != "" {
+			docTitles[r.block.DocumentID] = strings.ToLower(r.block.Content)
+		}
+	}
+
+	// For each non-document block, see if (doc title + block content) together
+	// contain all search words. If so, mark docAndBlockAllWordsMatch = true.
+	for i := range records {
+		if records[i].isDocument || records[i].parentDocumentID == "" {
+			continue
+		}
+
+		docTitle, ok := docTitles[records[i].parentDocumentID]
+		if !ok || len(searchWords) == 0 {
+			continue
+		}
+
+		lowerBlock := strings.ToLower(records[i].block.Content)
+		allFound := true
+		for _, w := range searchWords {
+			if !strings.Contains(lowerBlock, w) && !strings.Contains(docTitle, w) {
+				allFound = false
+				break
 			}
-		} else {
-			// Single word or no search - include all
+		}
+
+		if allFound {
+			records[i].docAndBlockAllWordsMatch = true
+		}
+	}
+
+	// Document-level aggregation: if all words appear somewhere in the document (across blocks),
+	// ensure we have the REAL document title block in results.
+	if len(searchWords) > 1 {
+		// 1) Build per-document word hit map
+		docWordHits := make(map[docKey][]bool)
+
+		for _, block := range allBlocks {
+			if block.DocumentID == "" {
+				continue
+			}
+			k := docKey{spaceID: block.SpaceID, docID: block.DocumentID}
+
+			hits, ok := docWordHits[k]
+			if !ok {
+				hits = make([]bool, len(searchWords))
+			}
+
+			lowerContent := strings.ToLower(block.Content)
+			for i, w := range searchWords {
+				if !hits[i] && strings.Contains(lowerContent, w) {
+					hits[i] = true
+				}
+			}
+
+			docWordHits[k] = hits
+		}
+
+		// 2) For each document where all search words are present across its blocks,
+		// mark the document as highly relevant and, if needed, ensure we have the REAL
+		// document row (c3='document') as a result.
+		for k, hits := range docWordHits {
+			if !allTrue(hits) {
+				continue
+			}
+
+			// IMPORTANT:
+			// Mark this document as highly relevant regardless of whether we already
+			// have its real title block in results or not. This is what drives the
+			// child-block boost later (parentDocumentWasTopRanked).
+			highlyRelevantDocumentIDs[k.docID] = true
+
+			// If we already have a real document block in results, nothing else to do.
+			if docHasRealTitle[k] {
+				continue
+			}
+
+			// Look up the space
+			space, ok := spaceByID[k.spaceID]
+			if !ok {
+				continue
+			}
+
+			// Fetch the real document row from BlockSearch_content by documentId (c7)
+			var (
+				docID     string
+				docTitle  string
+				entityTyp string
+				docDocID  string
+			)
+
+			row := space.DB.QueryRowContext(
+				ctx,
+				`SELECT c0 as id, c1 as content, c3 as entityType, c7 as documentId
+				 FROM BlockSearch_content
+				 WHERE c3 = 'document' AND c7 = ?
+				 LIMIT 1`,
+				k.docID,
+			)
+
+			if err := row.Scan(&docID, &docTitle, &entityTyp, &docDocID); err != nil {
+				// If we can't load a real doc row, skip; don't create fake ones.
+				continue
+			}
+
+			realDoc := Block{
+				ID:         docID,
+				SpaceID:    k.spaceID,
+				Content:    docTitle,
+				EntityType: entityTyp, // should be "document"
+				DocumentID: docDocID,  // same as k.docID
+			}
+
+			// Mark that now we have the real document title
+			docHasRealTitle[k] = true
+
+			record := scoreBlock(realDoc, searchPhrase, searchWords, len(records))
+			record.isDocument = true
+
 			records = append(records, record)
+		}
+	}
+
+	// The highlyRelevantDocumentIDs map is now populated only via document-level aggregation
+	// where all search words appear across the document's blocks (see above).
+	// This ensures it represents a stronger signal of overall document relevance.
+
+	// Now, iterate through all records to mark child blocks of highly relevant documents
+	for i := range records {
+		// Only apply this to non-document blocks that actually have a parent document ID
+		if !records[i].isDocument && records[i].parentDocumentID != "" {
+			if highlyRelevantDocumentIDs[records[i].parentDocumentID] {
+				records[i].parentDocumentWasTopRanked = true
+			}
 		}
 	}
 
@@ -564,65 +661,88 @@ func (b *BlockRepo) Search(ctx context.Context, terms []string, allSpaces bool, 
 		iRecord := records[i]
 		jRecord := records[j]
 
-		// 0) Acronym / subsequence signal
-		if iRecord.acronymMatch != jRecord.acronymMatch {
-			return iRecord.acronymMatch
-		}
-		if iRecord.acronymMatch && jRecord.acronymMatch {
-			// Both have acronym match → prefer document
-			if iRecord.isDocument != jRecord.isDocument {
-				return iRecord.isDocument
-			}
+		// Priority 1: Strict Document Title Match
+		// Documents whose title perfectly matches the entire search phrase, or contains all search words.
+		iP1 := iRecord.isDocument && (iRecord.exactMatch || iRecord.orderedWordsMatch || iRecord.allWordsMatch)
+		jP1 := jRecord.isDocument && (jRecord.exactMatch || jRecord.orderedWordsMatch || jRecord.allWordsMatch)
+		if iP1 != jP1 {
+			return iP1 // 'i' wins if it's a P1 match
 		}
 
-		// 1) Strongest: document whose title starts with the search phrase
+		// Priority 2: Parent Document where ALL search words were found across its blocks
+		// (This is derived from highlyRelevantDocumentIDs.)
+		iP2 := iRecord.isDocument && highlyRelevantDocumentIDs[iRecord.block.DocumentID]
+		jP2 := jRecord.isDocument && highlyRelevantDocumentIDs[jRecord.block.DocumentID]
+		if iP2 != jP2 {
+			return iP2 // 'i' wins if it's a P2 match
+		}
+
+		// Priority 3: Child block where (document title + this block) together contain ALL search words
+		// This is exactly the "Macrowhisper" (title) + "Release checklist" (block) scenario.
+		iP3 := !iRecord.isDocument && iRecord.docAndBlockAllWordsMatch
+		jP3 := !jRecord.isDocument && jRecord.docAndBlockAllWordsMatch
+		if iP3 != jP3 {
+			return iP3 // 'i' wins if it's a P3 match
+		}
+
+		// Priority 4: Relevant Child Block of a P2 Document
+		iP4 := !iRecord.isDocument && iRecord.parentDocumentWasTopRanked && iRecord.containsAnySearchWord
+		jP4 := !jRecord.isDocument && jRecord.parentDocumentWasTopRanked && jRecord.containsAnySearchWord
+		if iP4 != jP4 {
+			return iP4 // 'i' wins if it's a P4 match
+		}
+
+		// Priority 5: Document Title contains Any Search Word
+		iP5 := iRecord.isDocument && iRecord.documentTitleRelevant
+		jP5 := jRecord.isDocument && jRecord.documentTitleRelevant
+		if iP5 != jP5 {
+			return iP5 // 'i' wins if it's a P5 match
+		}
+
+		// --- General Match Strength (applies to any block/doc not covered by above specific boosts) ---
+
+		// Priority 6: Prefix match
 		if iRecord.prefixMatch != jRecord.prefixMatch {
-			// One has prefixMatch, the other doesn't
-			if iRecord.prefixMatch && !jRecord.prefixMatch {
-				// If i is a document and j is not, push i up
-				if iRecord.isDocument && !jRecord.isDocument {
-					return true
-				}
-				// Otherwise still prefer the prefix match
-				return true
-			}
-			if !iRecord.prefixMatch && jRecord.prefixMatch {
-				if jRecord.isDocument && !iRecord.isDocument {
-					return false
-				}
-				return false
-			}
+			return iRecord.prefixMatch
 		}
 
-		// Both prefixMatch == true or both == false
-		if iRecord.prefixMatch && jRecord.prefixMatch {
-			// Both have prefixMatch → prefer documents
-			if iRecord.isDocument != jRecord.isDocument {
-				return iRecord.isDocument
-			}
-		}
-
-		// 2) Exact phrase match
+		// Priority 7: Exact phrase match
 		if iRecord.exactMatch != jRecord.exactMatch {
 			return iRecord.exactMatch
 		}
 
-		// 3) Ordered words
+		// Priority 8: Ordered words match
 		if iRecord.orderedWordsMatch != jRecord.orderedWordsMatch {
 			return iRecord.orderedWordsMatch
 		}
 
-		// 4) All words
+		// Priority 9: All words match (any order)
 		if iRecord.allWordsMatch != jRecord.allWordsMatch {
 			return iRecord.allWordsMatch
 		}
 
-		// 5) Prefer documents (general)
+		// Priority 10: Acronym match
+		if iRecord.acronymMatch != jRecord.acronymMatch {
+			return iRecord.acronymMatch
+		}
+		// Tie-breaker for acronym matches: prefer documents
+		if iRecord.acronymMatch && jRecord.acronymMatch {
+			if iRecord.isDocument != jRecord.isDocument {
+				return iRecord.isDocument
+			}
+		}
+
+		// Priority 11: General preference for documents over non-documents
 		if iRecord.isDocument != jRecord.isDocument {
 			return iRecord.isDocument
 		}
 
-		// 6) Stable fallback
+		// Priority 12: Blocks that contain at least one search word
+		if iRecord.containsAnySearchWord != jRecord.containsAnySearchWord {
+			return iRecord.containsAnySearchWord
+		}
+
+		// Final Tie-breaker: Maintain original search order for stability
 		return iRecord.originalIndex < jRecord.originalIndex
 	})
 
